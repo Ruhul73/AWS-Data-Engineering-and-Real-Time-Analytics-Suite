@@ -1,0 +1,16 @@
+# Environment & Virtualenv
+.venv/
+**/.venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Testing & Cache
+.pytest_cache/
+*.parquet
+*.csv
+
+# OS
+.DS_Store

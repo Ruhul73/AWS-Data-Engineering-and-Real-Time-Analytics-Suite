@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Data Engineering & Real-Time Analytics Suite - Production Infrastructure'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'production'
+    Description: 'Target deployment environment name'
+  DataLakeBucketName:
+    Type: String
+    Default: 'aws-retail-datalake-demo'
+    Description: 'Name of the S3 Data Lake bucket'
+  KinesisStreamName:
+    Type: String
+    Default: 'iot-sensor-stream'
+    Description: 'Name of the Kinesis Data Stream'
+  OpenSearchDomainName:
+    Type: String
+    Default: 'iot-metrics-domain'
+    Description: 'Name of the OpenSearch domain'
+
+Resources:
+  # -------------------------------------------------------------------
+  # 1. Amazon S3 Data Lake Storage (Bronze, Silver, Athena Results)
+  # -------------------------------------------------------------------
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DataLakeBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # -------------------------------------------------------------------
+  # 2. Amazon Kinesis Data Stream (1 Shard Provisioned)
+  # -------------------------------------------------------------------
+  KinesisSensorStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref KinesisStreamName
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: 'alias/aws/kinesis'
+
+  # -------------------------------------------------------------------
+  # 3. AWS Glue Service Role & Catalog Database
+  # -------------------------------------------------------------------
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AWSGlueServiceRole-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3DataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataLakeBucket}'
+                  - !Sub 'arn:aws:s3:::${DataLakeBucket}/*'
+
+  GlueCatalogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: 'retail_datalake_db'
+        Description: 'Curated retail medallion data lake database'
+
+  # -------------------------------------------------------------------
+  # 4. AWS Lambda Execution Role & Function
+  # -------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AWSLambdaKinesisExecutionRole-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole
+      Policies:
+        - PolicyName: OpenSearchAndSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: '*'
+
+  LambdaAnomalyProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'lambda_anomaly_processor'
+      Runtime: 'python3.12'
+      Handler: 'lambda_anomaly_processor.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Sub 'https://${OpenSearchDomain.DomainEndpoint}'
+      Code:
+        ZipFile: |
+          import os, base64, json, urllib3
+          http = urllib3.PoolManager()
+          OPENSEARCH_URL = os.environ.get("OPENSEARCH_ENDPOINT", "")
+          HEADERS = {"Content-Type": "application/json"}
+          def lambda_handler(event, context):
+              processed, anomalies = 0, 0
+              for record in event.get("Records", []):
+                  raw_bytes = base64.b64decode(record["kinesis"]["data"])
+                  doc = json.loads(raw_bytes.decode("utf-8"))
+                  doc["is_anomaly"] = bool(doc.get("temperature", 0.0) > 90.0)
+                  if doc["is_anomaly"]:
+                      anomalies += 1
+                      print(f"CRITICAL ANOMALY DETECTED: {json.dumps(doc)}")
+                  if OPENSEARCH_URL:
+                      http.request("POST", f"{OPENSEARCH_URL}/iot-metrics/_doc", body=json.dumps(doc), headers=HEADERS)
+                  processed += 1
+              return {"statusCode": 200, "processed": processed, "anomalies": anomalies}
+
+  LambdaKinesisEventMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+      EventSourceArn: !GetAtt KinesisSensorStream.Arn
+      FunctionName: !GetAtt LambdaAnomalyProcessor.Arn
+      StartingPosition: LATEST
+
+  # -------------------------------------------------------------------
+  # 5. Amazon OpenSearch Domain (t3.small.search, EBS gp3)
+  # -------------------------------------------------------------------
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Ref OpenSearchDomainName
+      EngineVersion: 'OpenSearch_2.11'
+      ClusterConfig:
+        InstanceType: 't3.small.search'
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: 'gp3'
+        VolumeSize: 10
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+
+Outputs:
+  DataLakeBucketOutput:
+    Description: 'S3 Data Lake Bucket Name'
+    Value: !Ref DataLakeBucket
+  KinesisStreamOutput:
+    Description: 'Kinesis Stream Name'
+    Value: !Ref KinesisSensorStream
+  GlueDatabaseOutput:
+    Description: 'Glue Catalog Database'
+    Value: !Ref GlueCatalogDatabase
+  LambdaFunctionOutput:
+    Description: 'Lambda Anomaly Processor Function'
+    Value: !Ref LambdaAnomalyProcessor
+  OpenSearchEndpointOutput:
+    Description: 'OpenSearch Cluster Endpoint'
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+

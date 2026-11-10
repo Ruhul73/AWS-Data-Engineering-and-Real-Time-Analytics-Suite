@@ -1,0 +1,12 @@
+{
+  "fileLocations": [
+    {
+      "URIPrefixes": [
+        "s3://aws-retail-datalake-demo/silver/retail_sales/"
+      ]
+    }
+  ],
+  "globalUploadSettings": {
+    "format": "PARQUET"
+  }
+}
